@@ -16,6 +16,7 @@ package audiows
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/frostbyte73/core"
@@ -41,6 +42,13 @@ func (n *noopStateNotifier) UpdateIngressState(_ context.Context, _ string, _ *l
 const (
 	defaultFrameDuration = 20 * time.Millisecond
 	opusMimeType         = "audio/opus"
+	maxOpusFrameSize     = 1275 * 3 // Max Opus packet: 3 frames * 1275 bytes (RFC 6716 section 3.4)
+)
+
+var (
+	errEmptyFrame    = errors.New("empty opus frame")
+	errFrameTooLarge = errors.New("opus frame exceeds maximum size")
+	errFrameTooSmall = errors.New("opus frame too small for declared structure")
 )
 
 type AudioWSSession struct {
@@ -136,10 +144,52 @@ func NewAudioWSSession(
 }
 
 func (s *AudioWSSession) HandleOpusFrame(data []byte) error {
+	if err := validateOpusFrame(data); err != nil {
+		return err
+	}
 	return s.track.WriteSample(media.Sample{
 		Data:     data,
 		Duration: s.frameDuration,
 	}, nil)
+}
+
+// validateOpusFrame performs basic validation of an Opus frame.
+// Opus TOC byte structure: https://www.rfc-editor.org/rfc/rfc6716#section-3.1
+func validateOpusFrame(data []byte) error {
+	if len(data) == 0 {
+		return errEmptyFrame
+	}
+	if len(data) > maxOpusFrameSize {
+		return errFrameTooLarge
+	}
+
+	// Parse TOC byte to validate config/mode
+	toc := data[0]
+	config := toc >> 3     // 5 bits: configuration number (0-31)
+	_ = config             // all 32 configs are valid
+	s := (toc >> 2) & 0x01 // 1 bit: mono(0) or stereo(1)
+	_ = s                  // both valid
+	c := toc & 0x03        // 2 bits: frame count code
+
+	switch c {
+	case 0:
+		// Code 0: 1 frame — needs at least the compressed data
+		if len(data) < 2 {
+			return errFrameTooSmall
+		}
+	case 1, 2:
+		// Code 1: 2 equal-size frames; Code 2: 2 different-size frames
+		if len(data) < 2 {
+			return errFrameTooSmall
+		}
+	case 3:
+		// Code 3: arbitrary number of frames — needs at least TOC + frame count byte
+		if len(data) < 2 {
+			return errFrameTooSmall
+		}
+	}
+
+	return nil
 }
 
 func (s *AudioWSSession) Close() {
