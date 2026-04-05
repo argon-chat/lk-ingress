@@ -34,6 +34,7 @@ import (
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/psrpc"
 
+	"github.com/livekit/ingress/pkg/audiows"
 	"github.com/livekit/ingress/pkg/config"
 	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/ingress/pkg/params"
@@ -134,6 +135,7 @@ func runService(_ context.Context, c *cli.Command) error {
 
 	var rtmpsrv *rtmp.RTMPServer
 	var whipsrv *whip.WHIPServer
+	var audiowssrv *audiows.AudioWSServer
 	if conf.RTMPPort > 0 {
 		// Run RTMP server
 		rtmpsrv = rtmp.NewRTMPServer()
@@ -143,6 +145,9 @@ func runService(_ context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
+	}
+	if conf.AudioWSPort > 0 {
+		audiowssrv = audiows.NewAudioWSServer()
 	}
 
 	sn := utils.NewServiceStateNotifier(psrpcClient)
@@ -173,6 +178,12 @@ func runService(_ context.Context, c *cli.Command) error {
 			return err
 		}
 	}
+	if audiowssrv != nil {
+		err = audiowssrv.Start(conf, svc.GetMonitor())
+		if err != nil {
+			return err
+		}
+	}
 
 	err = relay.Start(conf)
 	if err != nil {
@@ -194,6 +205,9 @@ func runService(_ context.Context, c *cli.Command) error {
 			}
 			if whipsrv != nil {
 				whipsrv.Stop()
+			}
+			if audiowssrv != nil {
+				audiowssrv.Stop()
 			}
 
 		}

@@ -436,6 +436,14 @@ func (p *Params) GetLogger() logger.Logger {
 	return p.logger
 }
 
+func (p *Params) SetLogger(l logger.Logger) {
+	p.logger = l
+}
+
+func (p *Params) SetStateNotifier(sn utils.StateNotifier) {
+	p.stateNotifier = sn
+}
+
 func CopyRedactedIngressInfo(info *livekit.IngressInfo) *livekit.IngressInfo {
 	infoCopy := protoutils.CloneProto(info)
 

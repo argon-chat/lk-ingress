@@ -34,6 +34,7 @@ const (
 	DefaultRTMPPort      = 1935
 	DefaultWHIPPort      = 8080
 	DefaultHTTPRelayPort = 9090
+	DefaultAudioWSPort   = 7880
 )
 
 var (
@@ -54,8 +55,9 @@ type ServiceConfig struct {
 	HealthPort       int           `yaml:"health_port"`
 	DebugHandlerPort int           `yaml:"debug_handler_port"`
 	PrometheusPort   int           `yaml:"prometheus_port"`
-	RTMPPort         int           `yaml:"rtmp_port"` // -1 to disable RTMP
-	WHIPPort         int           `yaml:"whip_port"` // -1 to disable WHIP
+	RTMPPort         int           `yaml:"rtmp_port"`     // -1 to disable RTMP
+	WHIPPort         int           `yaml:"whip_port"`     // -1 to disable WHIP
+	AudioWSPort      int           `yaml:"audio_ws_port"` // -1 to disable AudioWS
 	HTTPRelayPort    int           `yaml:"http_relay_port"`
 	Logging          logger.Config `yaml:"logging"`
 	Development      bool          `yaml:"development"`
@@ -83,6 +85,7 @@ type CPUCostConfig struct {
 	WHIPCpuCost                  float64 `yaml:"whip_cpu_cost"`
 	WHIPBypassTranscodingCpuCost float64 `yaml:"whip_bypass_transcoding_cpu_cost"`
 	URLCpuCost                   float64 `yaml:"url_cpu_cost"`
+	AudioWSCpuCost               float64 `yaml:"audio_ws_cpu_cost"`
 	MinIdleRatio                 float64 `yaml:"min_idle_ratio"` // Target idle cpu ratio when deciding availability for new requests
 }
 
@@ -118,6 +121,9 @@ func (c *ServiceConfig) InitDefaults() error {
 	}
 	if c.WHIPPort == 0 {
 		c.WHIPPort = DefaultWHIPPort
+	}
+	if c.AudioWSPort == 0 {
+		c.AudioWSPort = DefaultAudioWSPort
 	}
 
 	err := c.InitWhipConf()

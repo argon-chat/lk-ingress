@@ -181,11 +181,20 @@ func (m *Monitor) checkCPUConfig() error {
 		)
 	}
 
+	if m.cpuCostConfig.AudioWSCpuCost < 0 {
+		logger.Warnw("audio WS input requirement too low", nil,
+			"config value", m.cpuCostConfig.AudioWSCpuCost,
+			"minimum value", 0.05,
+			"recommended value", 0.1,
+		)
+	}
+
 	requirements := []float64{
 		m.cpuCostConfig.RTMPCpuCost,
 		m.cpuCostConfig.WHIPCpuCost,
 		m.cpuCostConfig.WHIPBypassTranscodingCpuCost,
 		m.cpuCostConfig.URLCpuCost,
+		m.cpuCostConfig.AudioWSCpuCost,
 	}
 	sort.Float64s(requirements)
 	m.maxCost = requirements[len(requirements)-1]
@@ -316,6 +325,35 @@ func (m *Monitor) IngressEnded(info *livekit.IngressInfo) {
 	case livekit.IngressInput_URL_INPUT:
 		m.requestGauge.With(prometheus.Labels{"type": "url", "transcoding": fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
 	}
+}
+
+func (m *Monitor) AcceptAudioWSSession() bool {
+	if !m.started.IsBroken() || m.shutdown.IsBroken() {
+		return false
+	}
+
+	m.costConfigLock.Lock()
+	defer m.costConfigLock.Unlock()
+
+	available := m.getAvailable(m.cpuCostConfig.MinIdleRatio / 2)
+	cpuHold := m.cpuCostConfig.AudioWSCpuCost
+	accept := available > cpuHold
+
+	if accept {
+		m.pendingCPUs.Add(cpuHold)
+		time.AfterFunc(time.Second, func() { m.pendingCPUs.Sub(cpuHold) })
+	}
+
+	logger.Debugw("audio WS cpu request", "accepted", accept, "availableCPUs", available, "cpuHold", cpuHold)
+	return accept
+}
+
+func (m *Monitor) AudioWSSessionStarted() {
+	m.requestGauge.With(prometheus.Labels{"type": "audio_ws", "transcoding": "false"}).Add(1)
+}
+
+func (m *Monitor) AudioWSSessionEnded() {
+	m.requestGauge.With(prometheus.Labels{"type": "audio_ws", "transcoding": "false"}).Sub(1)
 }
 
 func (m *Monitor) getAvailable(minIdleRatio float64) float64 {

@@ -395,6 +395,10 @@ func (s *Service) handleNewPublisher(ctx context.Context, resourceId string, inp
 	return p, nil
 }
 
+func (s *Service) GetMonitor() *stats.Monitor {
+	return s.monitor
+}
+
 func (s *Service) UpdateConfig(conf *config.Config) {
 	s.confLock.Lock()
 	defer s.confLock.Unlock()
