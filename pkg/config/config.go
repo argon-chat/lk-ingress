@@ -57,8 +57,9 @@ type ServiceConfig struct {
 	PrometheusPort   int           `yaml:"prometheus_port"`
 	RTMPPort         int           `yaml:"rtmp_port"`     // -1 to disable RTMP
 	WHIPPort         int           `yaml:"whip_port"`     // -1 to disable WHIP
-	AudioWSPort      int           `yaml:"audio_ws_port"` // -1 to disable AudioWS
-	HTTPRelayPort    int           `yaml:"http_relay_port"`
+	AudioWSPort         int           `yaml:"audio_ws_port"`          // -1 to disable AudioWS
+	MaxAudioWSSessions  int           `yaml:"max_audio_ws_sessions"`  // 0 = unlimited
+	HTTPRelayPort       int           `yaml:"http_relay_port"`
 	Logging          logger.Config `yaml:"logging"`
 	Development      bool          `yaml:"development"`
 	WHIPProxyEnabled bool          `yaml:"whip_proxy_enabled"` // If true, WHIP requests with transcoding bypassed will be handled by the SFU directly

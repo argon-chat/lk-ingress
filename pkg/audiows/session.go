@@ -69,6 +69,7 @@ func NewAudioWSSession(
 	conf *config.Config,
 	stereo bool,
 	frameDurationMs int,
+	trackName, trackSource, metadata string,
 	onDisconnected func(),
 ) (*AudioWSSession, error) {
 	l := logger.GetLogger().WithValues(
@@ -77,7 +78,7 @@ func NewAudioWSSession(
 		"identity", identity,
 	)
 
-	token, err := ingress.BuildIngressToken(apiKey, apiSecret, room, identity, name, "", sessionID)
+	token, err := ingress.BuildIngressToken(apiKey, apiSecret, room, identity, name, metadata, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -85,17 +86,28 @@ func NewAudioWSSession(
 	resourceID := protoutils.NewGuid("AW_")
 	enableTranscoding := false
 
+	// Resolve track name and source
+	if trackName == "" {
+		trackName = "audio"
+	}
+	audioSource := livekit.TrackSource_MICROPHONE
+	switch trackSource {
+	case "screen_share_audio":
+		audioSource = livekit.TrackSource_SCREEN_SHARE_AUDIO
+	}
+
 	info := &livekit.IngressInfo{
 		IngressId:           sessionID,
 		StreamKey:           sessionID,
 		RoomName:            room,
 		ParticipantIdentity: identity,
 		ParticipantName:     name,
+		ParticipantMetadata: metadata,
 		InputType:           livekit.IngressInput_URL_INPUT, // closest existing type; not dispatched through normal ingress flow
 		EnableTranscoding:   &enableTranscoding,
 		Audio: &livekit.IngressAudioOptions{
-			Name:   "audio",
-			Source: livekit.TrackSource_MICROPHONE,
+			Name:   trackName,
+			Source: audioSource,
 		},
 		Video: &livekit.IngressVideoOptions{},
 		State: &livekit.IngressState{

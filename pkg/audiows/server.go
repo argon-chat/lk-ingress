@@ -161,6 +161,17 @@ func (s *AudioWSServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check max sessions limit
+	if s.conf.MaxAudioWSSessions > 0 {
+		s.sessionsLock.Lock()
+		count := len(s.sessions)
+		s.sessionsLock.Unlock()
+		if count >= s.conf.MaxAudioWSSessions {
+			http.Error(w, "max audio WS sessions reached", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	// Check CPU capacity
 	if !s.monitor.AcceptAudioWSSession() {
 		http.Error(w, "server at capacity", http.StatusServiceUnavailable)
@@ -170,6 +181,9 @@ func (s *AudioWSServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Parse audio config from query params
 	stereo := r.URL.Query().Get("stereo") == "true" || r.URL.Query().Get("channels") == "2"
 	frameDurationMs, _ := strconv.Atoi(r.URL.Query().Get("frame_duration_ms"))
+	trackName := r.URL.Query().Get("track_name")
+	trackSource := r.URL.Query().Get("track_source")
+	metadata := r.URL.Query().Get("metadata")
 
 	// Upgrade to WebSocket
 	conn, err := s.upgrader.Upgrade(w, r, nil)
@@ -180,12 +194,13 @@ func (s *AudioWSServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := protoutils.NewGuid("AWS_")
 	l := logger.GetLogger().WithValues("sessionID", sessionID, "room", room, "identity", identity)
-	l.Infow("new audio WS connection", "stereo", stereo, "frameDurationMs", frameDurationMs)
+	l.Infow("new audio WS connection", "stereo", stereo, "frameDurationMs", frameDurationMs,
+		"trackName", trackName, "trackSource", trackSource)
 
-	go s.runSession(conn, sessionID, room, identity, name, stereo, frameDurationMs, l)
+	go s.runSession(conn, sessionID, room, identity, name, stereo, frameDurationMs, trackName, trackSource, metadata, l)
 }
 
-func (s *AudioWSServer) runSession(conn *websocket.Conn, sessionID, room, identity, name string, stereo bool, frameDurationMs int, l logger.Logger) {
+func (s *AudioWSServer) runSession(conn *websocket.Conn, sessionID, room, identity, name string, stereo bool, frameDurationMs int, trackName, trackSource, metadata string, l logger.Logger) {
 	defer conn.Close()
 
 	conn.SetReadLimit(wsReadLimit)
@@ -204,6 +219,7 @@ func (s *AudioWSServer) runSession(conn *websocket.Conn, sessionID, room, identi
 		s.conf,
 		stereo,
 		frameDurationMs,
+		trackName, trackSource, metadata,
 		func() {
 			conn.Close()
 		},
