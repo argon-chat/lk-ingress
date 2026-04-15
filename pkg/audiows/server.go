@@ -65,12 +65,14 @@ type AudioWSServer struct {
 	sessionsLock      sync.Mutex
 	sessions          map[string]*AudioWSSession
 	subscribeSessions map[string]*AudioWSSubscriber
+	duplexSessions    map[string]*AudioWSDuplex
 }
 
 func NewAudioWSServer() *AudioWSServer {
 	return &AudioWSServer{
 		sessions:          make(map[string]*AudioWSSession),
 		subscribeSessions: make(map[string]*AudioWSSubscriber),
+		duplexSessions:    make(map[string]*AudioWSDuplex),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  wsReadLimit,
 			WriteBufferSize: 4 * 1024,
@@ -89,6 +91,7 @@ func (s *AudioWSServer) Start(conf *config.Config, monitor *stats.Monitor) error
 	mux := http.NewServeMux()
 	mux.HandleFunc("/audio/connect", s.handleConnect)
 	mux.HandleFunc("/audio/subscribe", s.handleSubscribe)
+	mux.HandleFunc("/audio/duplex", s.handleDuplex)
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", conf.AudioWSPort),
@@ -117,6 +120,10 @@ func (s *AudioWSServer) Stop() {
 	for _, sub := range s.subscribeSessions {
 		subs = append(subs, sub)
 	}
+	duplex := make([]*AudioWSDuplex, 0, len(s.duplexSessions))
+	for _, d := range s.duplexSessions {
+		duplex = append(duplex, d)
+	}
 	s.sessionsLock.Unlock()
 
 	for _, sess := range sessions {
@@ -124,6 +131,9 @@ func (s *AudioWSServer) Stop() {
 	}
 	for _, sub := range subs {
 		sub.Close()
+	}
+	for _, d := range duplex {
+		d.Close()
 	}
 
 	if s.server != nil {
@@ -174,7 +184,7 @@ func (s *AudioWSServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Check max sessions limit
 	if s.conf.MaxAudioWSSessions > 0 {
 		s.sessionsLock.Lock()
-		count := len(s.sessions) + len(s.subscribeSessions)
+		count := len(s.sessions) + len(s.subscribeSessions) + len(s.duplexSessions)
 		s.sessionsLock.Unlock()
 		if count >= s.conf.MaxAudioWSSessions {
 			http.Error(w, "max audio WS sessions reached", http.StatusServiceUnavailable)
@@ -464,5 +474,178 @@ func (s *AudioWSServer) addSubscribeSession(sub *AudioWSSubscriber) {
 func (s *AudioWSServer) removeSubscribeSession(sessionID string) {
 	s.sessionsLock.Lock()
 	delete(s.subscribeSessions, sessionID)
+	s.sessionsLock.Unlock()
+}
+
+func (s *AudioWSServer) handleDuplex(w http.ResponseWriter, r *http.Request) {
+	// Extract and validate JWT
+	tokenStr := extractToken(r)
+	if tokenStr == "" {
+		http.Error(w, "missing authorization token", http.StatusUnauthorized)
+		return
+	}
+
+	verifier, err := auth.ParseAPIToken(tokenStr)
+	if err != nil {
+		http.Error(w, "invalid token format", http.StatusUnauthorized)
+		return
+	}
+
+	if verifier.APIKey() != s.apiKey {
+		http.Error(w, "invalid API key", http.StatusForbidden)
+		return
+	}
+
+	_, grants, err := verifier.Verify(s.apiSecret)
+	if err != nil {
+		http.Error(w, "token verification failed", http.StatusForbidden)
+		return
+	}
+
+	if grants.Video == nil || grants.Video.Room == "" {
+		http.Error(w, "token must include room grant", http.StatusForbidden)
+		return
+	}
+
+	room := grants.Video.Room
+	identity := grants.Identity
+	name := grants.Name
+	if identity == "" {
+		http.Error(w, "token must include identity", http.StatusForbidden)
+		return
+	}
+
+	// Parse duplex-specific params
+	targetIdentity := r.URL.Query().Get("target_identity")
+	if targetIdentity == "" {
+		http.Error(w, "missing target_identity parameter", http.StatusBadRequest)
+		return
+	}
+	targetSource := r.URL.Query().Get("target_track_source")
+
+	// Parse audio publish config
+	stereo := r.URL.Query().Get("stereo") == "true" || r.URL.Query().Get("channels") == "2"
+	frameDurationMs, _ := strconv.Atoi(r.URL.Query().Get("frame_duration_ms"))
+	trackName := r.URL.Query().Get("track_name")
+	trackSource := r.URL.Query().Get("track_source")
+	metadata := r.URL.Query().Get("metadata")
+
+	// Check max sessions limit
+	if s.conf.MaxAudioWSSessions > 0 {
+		s.sessionsLock.Lock()
+		count := len(s.sessions) + len(s.subscribeSessions) + len(s.duplexSessions)
+		s.sessionsLock.Unlock()
+		if count >= s.conf.MaxAudioWSSessions {
+			http.Error(w, "max audio WS sessions reached", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
+	// Check CPU capacity
+	if !s.monitor.AcceptAudioWSSession() {
+		http.Error(w, "server at capacity", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Upgrade to WebSocket
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logger.Errorw("websocket upgrade failed", err)
+		return
+	}
+
+	sessionID := protoutils.NewGuid("AWS_")
+	l := logger.GetLogger().WithValues("sessionID", sessionID, "room", room, "identity", identity, "targetIdentity", targetIdentity)
+	l.Infow("new audio WS duplex connection",
+		"stereo", stereo, "frameDurationMs", frameDurationMs,
+		"trackName", trackName, "targetSource", targetSource,
+	)
+
+	go s.runDuplexSession(conn, sessionID, room, identity, name, targetIdentity, targetSource, stereo, frameDurationMs, trackName, trackSource, metadata, l)
+}
+
+func (s *AudioWSServer) runDuplexSession(
+	conn *websocket.Conn, sessionID, room, identity, name string,
+	targetIdentity, targetSource string,
+	stereo bool, frameDurationMs int,
+	trackName, trackSource, metadata string,
+	l logger.Logger,
+) {
+	defer conn.Close()
+
+	conn.SetReadLimit(wsReadLimit)
+	conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
+
+	duplex, err := NewAudioWSDuplex(
+		sessionID, conn,
+		room, identity, name,
+		targetIdentity, targetSource,
+		s.apiKey, s.apiSecret, s.wsUrl,
+		stereo, frameDurationMs,
+		trackName, trackSource, metadata,
+	)
+	if err != nil {
+		l.Errorw("failed to create duplex session", err)
+		writeError(conn, "failed to create duplex session: "+err.Error())
+		return
+	}
+
+	s.addDuplexSession(duplex)
+	defer func() {
+		s.removeDuplexSession(sessionID)
+		duplex.Close()
+		s.monitor.AudioWSSessionEnded()
+	}()
+
+	s.monitor.AudioWSSessionStarted()
+
+	// Send ready message
+	readyMsg, _ := json.Marshal(readyMessage{
+		Type:      "ready",
+		SessionID: sessionID,
+	})
+	conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	if err := conn.WriteMessage(websocket.TextMessage, readyMsg); err != nil {
+		l.Warnw("failed to send ready message", err)
+		return
+	}
+
+	// Start ping loop
+	go duplex.runPingLoop()
+
+	// Read loop — binary messages are Opus frames to publish
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				l.Warnw("websocket read error", err)
+			}
+			return
+		}
+
+		if msgType != websocket.BinaryMessage {
+			continue
+		}
+
+		if err := duplex.HandleOpusFrame(data); err != nil {
+			l.Warnw("failed to handle opus frame", err)
+			return
+		}
+	}
+}
+
+func (s *AudioWSServer) addDuplexSession(d *AudioWSDuplex) {
+	s.sessionsLock.Lock()
+	s.duplexSessions[d.SessionID()] = d
+	s.sessionsLock.Unlock()
+}
+
+func (s *AudioWSServer) removeDuplexSession(sessionID string) {
+	s.sessionsLock.Lock()
+	delete(s.duplexSessions, sessionID)
 	s.sessionsLock.Unlock()
 }
