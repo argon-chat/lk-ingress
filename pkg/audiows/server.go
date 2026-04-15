@@ -62,13 +62,15 @@ type AudioWSServer struct {
 	server   *http.Server
 	upgrader websocket.Upgrader
 
-	sessionsLock sync.Mutex
-	sessions     map[string]*AudioWSSession
+	sessionsLock      sync.Mutex
+	sessions          map[string]*AudioWSSession
+	subscribeSessions map[string]*AudioWSSubscriber
 }
 
 func NewAudioWSServer() *AudioWSServer {
 	return &AudioWSServer{
-		sessions: make(map[string]*AudioWSSession),
+		sessions:          make(map[string]*AudioWSSession),
+		subscribeSessions: make(map[string]*AudioWSSubscriber),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  wsReadLimit,
 			WriteBufferSize: 4 * 1024,
@@ -86,6 +88,7 @@ func (s *AudioWSServer) Start(conf *config.Config, monitor *stats.Monitor) error
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/audio/connect", s.handleConnect)
+	mux.HandleFunc("/audio/subscribe", s.handleSubscribe)
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", conf.AudioWSPort),
@@ -110,10 +113,17 @@ func (s *AudioWSServer) Stop() {
 	for _, sess := range s.sessions {
 		sessions = append(sessions, sess)
 	}
+	subs := make([]*AudioWSSubscriber, 0, len(s.subscribeSessions))
+	for _, sub := range s.subscribeSessions {
+		subs = append(subs, sub)
+	}
 	s.sessionsLock.Unlock()
 
 	for _, sess := range sessions {
 		sess.Close()
+	}
+	for _, sub := range subs {
+		sub.Close()
 	}
 
 	if s.server != nil {
@@ -164,7 +174,7 @@ func (s *AudioWSServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Check max sessions limit
 	if s.conf.MaxAudioWSSessions > 0 {
 		s.sessionsLock.Lock()
-		count := len(s.sessions)
+		count := len(s.sessions) + len(s.subscribeSessions)
 		s.sessionsLock.Unlock()
 		if count >= s.conf.MaxAudioWSSessions {
 			http.Error(w, "max audio WS sessions reached", http.StatusServiceUnavailable)
@@ -323,4 +333,136 @@ func writeError(conn *websocket.Conn, msg string) {
 	})
 	conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 	conn.WriteMessage(websocket.TextMessage, errMsg)
+}
+
+func (s *AudioWSServer) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	// Extract and validate JWT
+	tokenStr := extractToken(r)
+	if tokenStr == "" {
+		http.Error(w, "missing authorization token", http.StatusUnauthorized)
+		return
+	}
+
+	verifier, err := auth.ParseAPIToken(tokenStr)
+	if err != nil {
+		http.Error(w, "invalid token format", http.StatusUnauthorized)
+		return
+	}
+
+	if verifier.APIKey() != s.apiKey {
+		http.Error(w, "invalid API key", http.StatusForbidden)
+		return
+	}
+
+	_, grants, err := verifier.Verify(s.apiSecret)
+	if err != nil {
+		http.Error(w, "token verification failed", http.StatusForbidden)
+		return
+	}
+
+	if grants.Video == nil || grants.Video.Room == "" {
+		http.Error(w, "token must include room grant", http.StatusForbidden)
+		return
+	}
+
+	room := grants.Video.Room
+	identity := grants.Identity
+	name := grants.Name
+	if identity == "" {
+		http.Error(w, "token must include identity", http.StatusForbidden)
+		return
+	}
+
+	// Parse subscribe-specific params
+	targetIdentity := r.URL.Query().Get("target_identity")
+	if targetIdentity == "" {
+		http.Error(w, "missing target_identity parameter", http.StatusBadRequest)
+		return
+	}
+	targetSource := r.URL.Query().Get("target_track_source")
+
+	// Check max sessions limit
+	if s.conf.MaxAudioWSSessions > 0 {
+		s.sessionsLock.Lock()
+		count := len(s.sessions) + len(s.subscribeSessions)
+		s.sessionsLock.Unlock()
+		if count >= s.conf.MaxAudioWSSessions {
+			http.Error(w, "max audio WS sessions reached", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
+	// Check CPU capacity
+	if !s.monitor.AcceptAudioWSSession() {
+		http.Error(w, "server at capacity", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Upgrade to WebSocket
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logger.Errorw("websocket upgrade failed", err)
+		return
+	}
+
+	sessionID := protoutils.NewGuid("AWS_")
+	l := logger.GetLogger().WithValues("sessionID", sessionID, "room", room, "identity", identity, "targetIdentity", targetIdentity)
+	l.Infow("new audio WS subscribe connection", "targetSource", targetSource)
+
+	go s.runSubscribeSession(conn, sessionID, room, identity, name, targetIdentity, targetSource, l)
+}
+
+func (s *AudioWSServer) runSubscribeSession(conn *websocket.Conn, sessionID, room, identity, name, targetIdentity, targetSource string, l logger.Logger) {
+	defer conn.Close()
+
+	conn.SetReadLimit(1024)
+	conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
+
+	sub, err := NewAudioWSSubscriber(
+		sessionID, conn,
+		room, identity, name,
+		targetIdentity, targetSource,
+		s.apiKey, s.apiSecret, s.wsUrl,
+	)
+	if err != nil {
+		l.Errorw("failed to create subscriber session", err)
+		writeError(conn, "failed to create subscriber: "+err.Error())
+		return
+	}
+
+	s.addSubscribeSession(sub)
+	defer func() {
+		s.removeSubscribeSession(sessionID)
+		sub.Close()
+		s.monitor.AudioWSSessionEnded()
+	}()
+
+	s.monitor.AudioWSSessionStarted()
+
+	// Read loop — detect disconnect (subscriber sends no data)
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				l.Warnw("websocket read error", err)
+			}
+			return
+		}
+	}
+}
+
+func (s *AudioWSServer) addSubscribeSession(sub *AudioWSSubscriber) {
+	s.sessionsLock.Lock()
+	s.subscribeSessions[sub.SessionID()] = sub
+	s.sessionsLock.Unlock()
+}
+
+func (s *AudioWSServer) removeSubscribeSession(sessionID string) {
+	s.sessionsLock.Lock()
+	delete(s.subscribeSessions, sessionID)
+	s.sessionsLock.Unlock()
 }
