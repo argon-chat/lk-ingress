@@ -32,7 +32,7 @@ import (
 )
 
 type subscribedMessage struct {
-	Type                string `json:"type"`
+	Status              string `json:"status"`
 	SessionID           string `json:"session_id"`
 	TrackSID            string `json:"track_sid,omitempty"`
 	ParticipantIdentity string `json:"participant_identity,omitempty"`
@@ -90,7 +90,7 @@ func NewAudioWSSubscriber(
 		if rp.Identity() == sub.targetIdentity {
 			l.Infow("target participant disconnected")
 			sub.sendJSON(subscribedMessage{
-				Type:                "target_left",
+				Status:              "target_left",
 				SessionID:           sessionID,
 				ParticipantIdentity: targetIdentity,
 			})
@@ -124,7 +124,7 @@ func NewAudioWSSubscriber(
 	if !found {
 		l.Infow("target not yet in room, waiting")
 		sub.sendJSON(subscribedMessage{
-			Type:                "waiting",
+			Status:              "waiting",
 			SessionID:           sessionID,
 			ParticipantIdentity: targetIdentity,
 		})
@@ -174,7 +174,7 @@ func (s *AudioWSSubscriber) onTrackSubscribed(track *webrtc.TrackRemote, pub *lk
 	)
 
 	s.sendJSON(subscribedMessage{
-		Type:                "subscribed",
+		Status:              "subscribed",
 		SessionID:           s.sessionID,
 		TrackSID:            pub.SID(),
 		ParticipantIdentity: rp.Identity(),

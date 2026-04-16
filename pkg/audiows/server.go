@@ -42,13 +42,13 @@ const (
 
 // readyMessage is sent to the bot after the audio track is published.
 type readyMessage struct {
-	Type      string `json:"type"`
+	Status    string `json:"status"`
 	SessionID string `json:"session_id"`
 }
 
 // errorMessage is sent to the bot on error before closing the connection.
 type errorMessage struct {
-	Type    string `json:"type"`
+	Status  string `json:"status"`
 	Message string `json:"message"`
 }
 
@@ -261,7 +261,7 @@ func (s *AudioWSServer) runSession(conn *websocket.Conn, sessionID, room, identi
 
 	// Send ready message
 	readyMsg, _ := json.Marshal(readyMessage{
-		Type:      "ready",
+		Status:    "ready",
 		SessionID: sessionID,
 	})
 	conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
@@ -338,7 +338,7 @@ func extractToken(r *http.Request) string {
 
 func writeError(conn *websocket.Conn, msg string) {
 	errMsg, _ := json.Marshal(errorMessage{
-		Type:    "error",
+		Status:  "error",
 		Message: msg,
 	})
 	conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
@@ -605,7 +605,7 @@ func (s *AudioWSServer) runDuplexSession(
 
 	// Send ready message
 	readyMsg, _ := json.Marshal(readyMessage{
-		Type:      "ready",
+		Status:    "ready",
 		SessionID: sessionID,
 	})
 	conn.SetWriteDeadline(time.Now().Add(wsWriteWait))

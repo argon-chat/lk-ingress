@@ -107,7 +107,7 @@ func NewAudioWSDuplex(
 		if rp.Identity() == d.targetIdentity {
 			l.Infow("target participant disconnected")
 			d.sendJSON(subscribedMessage{
-				Type:                "target_left",
+				Status:              "target_left",
 				SessionID:           sessionID,
 				ParticipantIdentity: targetIdentity,
 			})
@@ -209,7 +209,7 @@ func (d *AudioWSDuplex) onTrackSubscribed(track *webrtc.TrackRemote, pub *lksdk.
 	)
 
 	d.sendJSON(subscribedMessage{
-		Type:                "subscribed",
+		Status:              "subscribed",
 		SessionID:           d.sessionID,
 		TrackSID:            pub.SID(),
 		ParticipantIdentity: rp.Identity(),
