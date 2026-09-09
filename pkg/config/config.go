@@ -20,14 +20,16 @@ import (
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 
-	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/logger/medialogutils"
 	"github.com/livekit/protocol/redis"
+	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
 	"github.com/livekit/psrpc"
 	lksdk "github.com/livekit/server-sdk-go/v2"
+
+	"github.com/livekit/ingress/pkg/errors"
 )
 
 const (
@@ -52,17 +54,33 @@ type ServiceConfig struct {
 	ApiSecret string             `yaml:"api_secret"` // required (env LIVEKIT_API_SECRET)
 	WsUrl     string             `yaml:"ws_url"`     // required (env LIVEKIT_WS_URL)
 
-	HealthPort       int           `yaml:"health_port"`
-	DebugHandlerPort int           `yaml:"debug_handler_port"`
-	PrometheusPort   int           `yaml:"prometheus_port"`
-	RTMPPort         int           `yaml:"rtmp_port"`     // -1 to disable RTMP
-	WHIPPort         int           `yaml:"whip_port"`     // -1 to disable WHIP
-	AudioWSPort         int           `yaml:"audio_ws_port"`          // -1 to disable AudioWS
-	MaxAudioWSSessions  int           `yaml:"max_audio_ws_sessions"`  // 0 = unlimited
-	HTTPRelayPort       int           `yaml:"http_relay_port"`
-	Logging          logger.Config `yaml:"logging"`
-	Development      bool          `yaml:"development"`
-	WHIPProxyEnabled bool          `yaml:"whip_proxy_enabled"` // If true, WHIP requests with transcoding bypassed will be handled by the SFU directly
+	HealthPort         int             `yaml:"health_port"`
+	DebugHandlerPort   int             `yaml:"debug_handler_port"`
+	PrometheusPort     int             `yaml:"prometheus_port"`
+	RTMPPort           int             `yaml:"rtmp_port"`             // -1 to disable RTMP
+	WHIPPort           int             `yaml:"whip_port"`             // -1 to disable WHIP
+	AudioWSPort        int             `yaml:"audio_ws_port"`         // -1 to disable AudioWS
+	MaxAudioWSSessions int             `yaml:"max_audio_ws_sessions"` // 0 = unlimited
+	HTTPRelayPort      int             `yaml:"http_relay_port"`
+	Logging            logger.Config   `yaml:"logging"`
+	Development        bool            `yaml:"development"`
+	PSRPCSkipClaim     bool            `yaml:"psrpc_skip_claim,omitempty"` // Lets psrpc servers skip the claim handshake on queue rpcs
+	PSRPC              rpc.PSRPCConfig `yaml:"psrpc,omitempty"`
+	// Allow URL pull ingresses to pull from udp:// urls. Disabled by default, and should only be
+	// enabled on deployments where both the API callers and the network the handlers run on are trusted.
+	// Unlike the http and srt sources, udpsrc doesn't connect out to the url host: it binds a local
+	// socket on the address and port taken from the caller provided url, and joins the multicast group
+	// if one is given. This has a few consequences:
+	//   - The caller controls which local port the handler binds, and can collide with other services
+	//     running on the host.
+	//   - UDP is connectionless and unauthenticated, so any host able to reach that port can inject
+	//     media into the session, or spoof the sender address to disrupt a legitimate feed.
+	//   - The caller can make the handler join arbitrary multicast groups and republish whatever
+	//     traffic it receives into a LiveKit room, turning the ingress into a relay for streams on
+	//     the handler's local network that the caller couldn't otherwise reach.
+	EnableUDPURLPull bool `yaml:"enable_udp_url_pull,omitempty"`
+	// Network interface to join multicast groups on for UDP url pull. Empty means let the OS decide.
+	MulticastInterface string `yaml:"multicast_interface,omitempty"`
 
 	// Used for WHIP transport
 	RTCConfig rtcconfig.RTCConfig `yaml:"rtc_config"`
@@ -96,6 +114,7 @@ func NewConfig(confString string) (*Config, error) {
 			ApiKey:    os.Getenv("LIVEKIT_API_KEY"),
 			ApiSecret: os.Getenv("LIVEKIT_API_SECRET"),
 			WsUrl:     os.Getenv("LIVEKIT_WS_URL"),
+			PSRPC:     rpc.DefaultPSRPCConfig,
 		},
 		InternalConfig: &InternalConfig{
 			ServiceName: "ingress",
@@ -113,6 +132,12 @@ func NewConfig(confString string) (*Config, error) {
 
 	return conf, nil
 }
+
+// SkipClaimEnabled gates psrpc.WithServerSkipClaim on the ingress rpc servers.
+func (c *ServiceConfig) SkipClaimEnabled() bool {
+	return c.PSRPCSkipClaim
+}
+
 func (c *ServiceConfig) InitDefaults() error {
 	if c.RTMPPort == 0 {
 		c.RTMPPort = DefaultRTMPPort

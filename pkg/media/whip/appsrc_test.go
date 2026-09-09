@@ -12,31 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package test
+package whip
 
 import (
 	"testing"
 
+	"github.com/go-gst/go-gst/gst"
+	"github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
-
-	"github.com/livekit/protocol/redis"
-	"github.com/livekit/protocol/rpc"
-	"github.com/livekit/psrpc"
-
-	"github.com/livekit/ingress/pkg/service"
-	"github.com/livekit/ingress/pkg/utils"
 )
 
-func TestIngress(t *testing.T) {
-	conf := getConfig(t)
+func TestGetCapsForCodecH264UsesAccessUnitAlignment(t *testing.T) {
+	gst.Init(nil)
 
-	rc, err := redis.GetRedisClient(conf.Redis)
+	caps, err := getCapsForCodec(webrtc.MimeTypeH264)
 	require.NoError(t, err)
-	require.NotNil(t, rc, "redis required")
+	require.NotNil(t, caps)
 
-	bus := psrpc.NewRedisMessageBus(rc, conf.PSRPC.BusOptions()...)
+	structure := caps.GetStructureAt(0)
+	require.NotNil(t, structure)
+	require.Equal(t, "video/x-h264", structure.Name())
 
-	RunTestSuite(t, conf, bus, func(psrpcClient rpc.IOInfoClient) utils.StateNotifier {
-		return utils.NewServiceStateNotifier(psrpcClient)
-	}, service.NewCmd)
+	streamFormat, err := structure.GetValue("stream-format")
+	require.NoError(t, err)
+	require.Equal(t, "byte-stream", streamFormat)
+
+	alignment, err := structure.GetValue("alignment")
+	require.NoError(t, err)
+	require.Equal(t, "au", alignment)
 }

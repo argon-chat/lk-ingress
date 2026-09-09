@@ -22,8 +22,10 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: read
+
 env:
-  GOVERSION: "1.25.0"
   GSTVERSION: "1.26.7"
 
 jobs:
@@ -33,21 +35,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/go/bin
-            ~/bin/protoc
-            ~/.cache
-          key: ${{ runner.os }}-ingress-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-ingress
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Docker metadata
         id: docker-md
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ github.repository }}
           # generate Docker tags based on the following events/attributes
@@ -56,29 +48,21 @@ jobs:
             type=semver,pattern=v{{major}}.{{minor}}
             type=sha
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.25"
-
-      - name: Download Go modules
-        run: go mod download
-
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: ./build/ingress/Dockerfile
@@ -87,5 +71,5 @@ jobs:
           tags: ${{ steps.docker-md.outputs.tags }}
           labels: ${{ steps.docker-md.outputs.labels }}
           build-args: |
-            GOVERSION=${{ env.GOVERSION }}
             GSTVERSION=${{ env.GSTVERSION }}
+            SECURITY_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}

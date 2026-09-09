@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2026 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,31 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package test
+package ipc
 
 import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/livekit/protocol/redis"
-	"github.com/livekit/protocol/rpc"
-	"github.com/livekit/psrpc"
-
-	"github.com/livekit/ingress/pkg/service"
-	"github.com/livekit/ingress/pkg/utils"
+	"github.com/livekit/ingress/pkg/testutil"
 )
 
-func TestIngress(t *testing.T) {
-	conf := getConfig(t)
+type testHandler struct {
+	UnimplementedIngressHandlerServer
+}
 
-	rc, err := redis.GetRedisClient(conf.Redis)
+func TestStartHandlerServerRebindsExistingSocket(t *testing.T) {
+	tmpDir := testutil.ShortTempDir(t)
+
+	_, err := StartHandlerServer(tmpDir, &testHandler{})
 	require.NoError(t, err)
-	require.NotNil(t, rc, "redis required")
 
-	bus := psrpc.NewRedisMessageBus(rc, conf.PSRPC.BusOptions()...)
-
-	RunTestSuite(t, conf, bus, func(psrpcClient rpc.IOInfoClient) utils.StateNotifier {
-		return utils.NewServiceStateNotifier(psrpcClient)
-	}, service.NewCmd)
+	// a relaunched handler must be able to bind after a previous process
+	// died without unlinking its socket
+	_, err = StartHandlerServer(tmpDir, &testHandler{})
+	require.NoError(t, err)
 }

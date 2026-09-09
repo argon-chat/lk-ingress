@@ -206,7 +206,7 @@ func getLive(info *livekit.IngressInfo) bool {
 }
 
 func getLoggerFields(info *livekit.IngressInfo, loggingFields map[string]string) []interface{} {
-	fields := []interface{}{"ingressID", info.IngressId, "resourceID", info.State.ResourceId, "roomName", info.RoomName, "participantIdentity", info.ParticipantIdentity}
+	fields := []interface{}{"ingressID", info.IngressId, "resourceID", info.State.ResourceId, "room", info.RoomName, "participant", info.ParticipantIdentity}
 	for k, v := range loggingFields {
 		fields = append(fields, k, v)
 	}
@@ -353,14 +353,15 @@ func (p *Params) SetRoomId(roomId string) {
 	p.State.RoomId = roomId
 }
 
-func (p *Params) SetInputAudioState(ctx context.Context, audioState *livekit.InputAudioState, sendUpdateIfModified bool) {
+func (p *Params) SetInputAudioState(ctx context.Context, audioState *livekit.InputAudioState, sendUpdateIfModified bool, overrideBitrate bool) {
 	p.stateLock.Lock()
 	modified := false
 
-	// Do not overwrite the bitrate
-	if audioState != nil && p.State.Audio != nil {
+	if !overrideBitrate && audioState != nil && p.State.Audio != nil {
 		audioState.AverageBitrate = p.State.Audio.AverageBitrate
 	}
+
+	mimeTypeChanged := p.State.Audio.GetMimeType() != audioState.GetMimeType()
 
 	if !proto.Equal(audioState, p.State.Audio) {
 		modified = true
@@ -368,25 +369,34 @@ func (p *Params) SetInputAudioState(ctx context.Context, audioState *livekit.Inp
 	}
 	p.stateLock.Unlock()
 
+	if mimeTypeChanged {
+		p.logger.Infow("source audio mime type changed", "mimeType", audioState.GetMimeType())
+	}
+
 	if modified && sendUpdateIfModified {
 		p.SendStateUpdate(ctx)
 	}
 }
 
-func (p *Params) SetInputVideoState(ctx context.Context, videoState *livekit.InputVideoState, sendUpdateIfModified bool) {
+func (p *Params) SetInputVideoState(ctx context.Context, videoState *livekit.InputVideoState, sendUpdateIfModified bool, overrideBitrate bool) {
 	p.stateLock.Lock()
 	modified := false
 
-	// Do not overwrite the bitrate
-	if videoState != nil && p.State.Video != nil {
+	if !overrideBitrate && videoState != nil && p.State.Video != nil {
 		videoState.AverageBitrate = p.State.Video.AverageBitrate
 	}
+
+	mimeTypeChanged := p.State.Video.GetMimeType() != videoState.GetMimeType()
 
 	if !proto.Equal(videoState, p.State.Video) {
 		modified = true
 		p.State.Video = videoState
 	}
 	p.stateLock.Unlock()
+
+	if mimeTypeChanged {
+		p.logger.Infow("source video mime type changed", "mimeType", videoState.GetMimeType())
+	}
 
 	if modified && sendUpdateIfModified {
 		p.SendStateUpdate(ctx)

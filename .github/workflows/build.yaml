@@ -19,17 +19,20 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+
+permissions:
+  contents: read
+
 env:
-  GOVERSION: "1.25.0"
   GSTVERSION: "1.26.7"
 
 jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           lfs: true
 
       - name: Build docker image
-        run: docker build -t ingress -f ./build/ingress/Dockerfile --build-arg GOVERSION=$GOVERSION --build-arg GSTVERSION=$GSTVERSION .
+        run: docker build -t ingress -f ./build/ingress/Dockerfile --build-arg GSTVERSION=$GSTVERSION --build-arg SECURITY_REFRESH=${{ github.run_id }}-${{ github.run_attempt }} .

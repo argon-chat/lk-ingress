@@ -73,8 +73,8 @@ func (s *ioServer) GetIngressInfo(_ context.Context, req *rpc.GetIngressInfoRequ
 	return s.getIngressInfo(req)
 }
 
-func (s *ioServer) CreateIngress(_ context.Context, _ *livekit.IngressInfo) (*emptypb.Empty, error) {
-	return &emptypb.Empty{}, nil
+func (s *ioServer) CreateIngress(_ context.Context, info *livekit.IngressInfo) (*rpc.CreateIngressResponse, error) {
+	return &rpc.CreateIngressResponse{Info: info}, nil
 }
 
 func (s *ioServer) UpdateIngressState(_ context.Context, req *rpc.UpdateIngressStateRequest) (*emptypb.Empty, error) {
@@ -97,10 +97,10 @@ func (s *ioServer) RecordCallContext(context.Context, *rpc.RecordCallContextRequ
 	return &emptypb.Empty{}, nil
 }
 
-func getDefaultConfig() *TestConfig {
+func GetDefaultConfig() *TestConfig {
 	tc := &TestConfig{
 		Config: &config.Config{
-			ServiceConfig:  &config.ServiceConfig{},
+			ServiceConfig:  &config.ServiceConfig{PSRPC: rpc.DefaultPSRPCConfig},
 			InternalConfig: &config.InternalConfig{},
 		},
 	}
@@ -115,7 +115,7 @@ func getDefaultConfig() *TestConfig {
 }
 
 func getConfig(t *testing.T) *TestConfig {
-	tc := getDefaultConfig()
+	tc := GetDefaultConfig()
 
 	confString := os.Getenv("INGRESS_CONFIG_BODY")
 	if confString == "" {
@@ -157,6 +157,9 @@ func RunTestSuite(t *testing.T, conf *TestConfig, bus psrpc.MessageBus, getState
 	if !conf.RtmpOnly && !conf.WhipOnly {
 		t.Run("URL pul", func(t *testing.T) {
 			RunURLTest(t, conf, bus, commandPsrpcClient, psrpcClient, sn, newCmd)
+		})
+		t.Run("URL pull truncated", func(t *testing.T) {
+			RunURLTruncatedTest(t, conf, bus, psrpcClient, sn, newCmd)
 		})
 	}
 

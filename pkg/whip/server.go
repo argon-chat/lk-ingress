@@ -27,7 +27,6 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
-	google_protobuf2 "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/livekit/ingress/pkg/config"
 	"github.com/livekit/ingress/pkg/errors"
@@ -35,7 +34,6 @@ import (
 	"github.com/livekit/ingress/pkg/stats"
 	"github.com/livekit/ingress/pkg/types"
 
-	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
@@ -63,19 +61,25 @@ type WHIPServer struct {
 	handlersLock sync.Mutex
 	handlers     map[string]WHIPHandler
 
-	getWhipProxyEnabled func(ctx context.Context, featureFlags map[string]string) bool
+	monitor *stats.Monitor
+}
+
+func (s *WHIPServer) SetMonitor(monitor *stats.Monitor) {
+	s.monitor = monitor
+}
+
+type WHIPInitResponse struct {
+	SDPAnswer   string
+	LinkHeaders []string
+	ETag        string
 }
 
 type WHIPHandler interface {
-	Init(ctx context.Context, sdpOffer string) (string, error)
+	Init(ctx context.Context, sdpOffer string) (*WHIPInitResponse, error)
 	SetMediaStatsGatherer(st *stats.LocalMediaStatsGatherer)
 	Start(ctx context.Context) (map[types.StreamKind]string, error)
 	WaitForSessionEnd(ctx context.Context) error
 	Close()
-	UpdateIngress(ctx context.Context, req *livekit.UpdateIngressRequest) (*livekit.IngressState, error)
-	DeleteIngress(ctx context.Context, req *livekit.DeleteIngressRequest) (*livekit.IngressState, error)
-	DeleteWHIPResource(ctx context.Context, req *rpc.DeleteWHIPResourceRequest) (*google_protobuf2.Empty, error)
-	ICERestartWHIPResource(ctx context.Context, req *rpc.ICERestartWHIPResourceRequest) (*rpc.ICERestartWHIPResourceResponse, error)
 	AssociateRelay(kind types.StreamKind, token string, w io.WriteCloser) error
 	DissociateRelay(kind types.StreamKind)
 }
@@ -96,7 +100,6 @@ func NewWHIPServer(bus psrpc.MessageBus) (*WHIPServer, error) {
 func (s *WHIPServer) Start(
 	conf *config.Config,
 	onPublish func(streamKey, resourceId string) (*params.Params, func(mimeTypes map[types.StreamKind]string, err error) *stats.LocalMediaStatsGatherer, func(error), error),
-	getWhipProxyEnabled func(ctx context.Context, featureFlags map[string]string) bool,
 	healthHandlers HealthHandlers,
 ) error {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
@@ -108,7 +111,6 @@ func (s *WHIPServer) Start(
 	}
 
 	s.onPublish = onPublish
-	s.getWhipProxyEnabled = getWhipProxyEnabled
 	s.conf = conf
 
 	var err error
@@ -187,6 +189,7 @@ func (s *WHIPServer) Start(
 
 		logger.Infow("handling ICE Restart request", "resourceID", resourceID)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "ETag")
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -317,37 +320,48 @@ func (s *WHIPServer) handleError(err error, w http.ResponseWriter) {
 	}
 }
 
-func (s *WHIPServer) handleNewWhipClient(w http.ResponseWriter, r *http.Request, streamKey string) error {
+func (s *WHIPServer) handleNewWhipClient(w http.ResponseWriter, r *http.Request, streamKey string) (err error) {
 	// TODO return ETAG header
+
+	defer func() {
+		s.monitor.RecordPublicationResult("whip", err)
+	}()
 
 	vars := mux.Vars(r)
 	app := vars["app"]
 
 	sdpOffer := bytes.Buffer{}
 
-	_, err := io.Copy(&sdpOffer, r.Body)
+	_, err = io.Copy(&sdpOffer, r.Body)
 	if err != nil {
 		return err
 	}
 
 	logger.Debugw("new whip request", "streamKey", streamKey, "sdpOffer", sdpOffer.String(), "userAgent", r.Header.Get("User-Agent"))
 
-	resourceId, sdp, err := s.createStream(streamKey, sdpOffer.String(), r.Header.Get("User-Agent"))
+	resourceId, res, err := s.createStream(streamKey, sdpOffer.String(), r.Header.Get("User-Agent"))
 	if err != nil {
 		return err
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Expose-Headers", "Location")
+	w.Header().Set("Access-Control-Expose-Headers", "Location, Link, ETag")
 	w.Header().Set("Content-Type", "application/sdp")
 	w.Header().Set("Location", fmt.Sprintf("/%s/%s/%s", app, streamKey, resourceId))
-	w.Header().Set("ETag", fmt.Sprintf("%08x", crc32.ChecksumIEEE(sdpOffer.Bytes())))
+	etag := res.ETag
+	if etag == "" {
+		etag = fmt.Sprintf("%08x", crc32.ChecksumIEEE(sdpOffer.Bytes()))
+	}
+	w.Header().Set("ETag", etag)
+	for _, l := range res.LinkHeaders {
+		w.Header().Add("Link", l)
+	}
 	w.WriteHeader(http.StatusCreated)
-	_, _ = w.Write([]byte(sdp))
+	_, _ = w.Write([]byte(res.SDPAnswer))
 
 	return nil
 }
 
-func (s *WHIPServer) createStream(streamKey string, sdpOffer string, ua string) (string, string, error) {
+func (s *WHIPServer) createStream(streamKey string, sdpOffer string, ua string) (string, *WHIPInitResponse, error) {
 	ctx, done := context.WithTimeout(s.ctx, sdpResponseTimeout)
 	defer done()
 
@@ -355,27 +369,21 @@ func (s *WHIPServer) createStream(streamKey string, sdpOffer string, ua string) 
 
 	p, ready, ended, err := s.onPublish(streamKey, resourceId)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 
 	var h WHIPHandler
-	if *p.EnableTranscoding || s.getWhipProxyEnabled == nil || !s.getWhipProxyEnabled(ctx, p.FeatureFlags) {
+	if *p.EnableTranscoding {
 		logger.Infow("Using native WHIP handler", "ingressID", p.IngressId, "resourceID", resourceId, "streamKey", streamKey)
-
-		var bus psrpc.MessageBus
-		if !*p.EnableTranscoding {
-			// RPC is handled in the handler process when transcoding
-			bus = s.bus
-		}
-		h, err = newWHIPHandler(p, s.webRTCConfig, bus)
-		if err != nil {
-			return "", "", err
-		}
+		h = newWHIPHandler(p, s.webRTCConfig)
 	} else {
 		logger.Infow("Using proxied WHIP handler", "ingressID", p.IngressId, "resourceID", resourceId, "streamKey", streamKey)
 		h, err = NewProxyWHIPHandler(p, s.bus, ua)
 		if err != nil {
-			return "", "", err
+			// The caller is handed ready and ended together and expects one of
+			// them; returning without either strands whatever it set up.
+			ready(nil, err)
+			return "", nil, err
 		}
 	}
 
@@ -384,7 +392,7 @@ func (s *WHIPServer) createStream(streamKey string, sdpOffer string, ua string) 
 		ready(nil, err)
 
 		h.Close()
-		return "", "", err
+		return "", nil, err
 	}
 
 	go func() {
@@ -453,6 +461,6 @@ func setCORSHeaders(w http.ResponseWriter, _ *http.Request, resourceEndpoint boo
 	} else {
 		w.Header().Set("Accept-Post", "application/sdp")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Expose-Headers", "Location")
+		w.Header().Set("Access-Control-Expose-Headers", "Location, Link, ETag")
 	}
 }

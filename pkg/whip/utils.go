@@ -50,7 +50,7 @@ func createJitterBuffer(
 	switch strings.ToLower(track.Codec().MimeType) {
 	case strings.ToLower(webrtc.MimeTypeH264), strings.ToLower(webrtc.MimeTypeVP8):
 		maxLatency = maxVideoLatency
-		options = append(options, jitter.WithPacketLossHandler(func() { writePLI(track.SSRC()) }))
+		options = append(options, jitter.WithPacketLossHandler(func(_, _ uint64) { writePLI(track.SSRC()) }))
 
 	case strings.ToLower(webrtc.MimeTypeOpus):
 		maxLatency = maxAudioLatency
@@ -88,34 +88,4 @@ func extractICEDetails(in []byte) (ufrag string, pwd string, err error) {
 	}
 
 	return
-}
-
-func replaceICEDetails(in, ufrag, pwd string) (string, error) {
-	var parsed sdp.SessionDescription
-	replaceAttributes := func(attributes []sdp.Attribute) {
-		for i := range attributes {
-			switch attributes[i].Key {
-			case "ice-ufrag":
-				attributes[i].Value = ufrag
-			case "ice-pwd":
-				attributes[i].Value = pwd
-			}
-		}
-	}
-
-	if err := parsed.UnmarshalString(in); err != nil {
-		return "", err
-	}
-
-	replaceAttributes(parsed.Attributes)
-	for _, m := range parsed.MediaDescriptions {
-		replaceAttributes(m.Attributes)
-	}
-
-	newRemoteDescription, err := parsed.Marshal()
-	if err != nil {
-		return "", err
-	}
-
-	return string(newRemoteDescription), nil
 }

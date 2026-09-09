@@ -32,6 +32,7 @@ import (
 	"github.com/livekit/psrpc"
 	google_protobuf2 "google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/ingress/pkg/stats"
 	"github.com/livekit/ingress/pkg/types"
@@ -65,7 +66,7 @@ func NewProxyWHIPHandler(p *params.Params, bus psrpc.MessageBus, ua string) (WHI
 		ua:     ua,
 	}
 
-	rpcServer, err := rpc.NewIngressHandlerServer(h, bus)
+	rpcServer, err := rpc.NewIngressHandlerServer(h, bus, psrpc.WithServerSkipClaim(p.SkipClaimEnabled))
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +98,7 @@ func getErrorCodeForStatus(statusCode int) psrpc.ErrorCode {
 	}
 }
 
-func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (string, error) {
+func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (*WHIPInitResponse, error) {
 	protocol := "http"
 	urlBase := ""
 	switch {
@@ -113,17 +114,17 @@ func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (string, err
 		urlBase = strings.TrimPrefix(h.params.WsUrl, "http://")
 
 	default:
-		return "", psrpc.NewErrorf(psrpc.InvalidArgument, "Invalid wsURL")
+		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "Invalid wsURL")
 	}
 
 	urlObj, err := url.Parse(fmt.Sprintf("%s://%s/whip/v1", protocol, urlBase))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	req, err := http.NewRequest("POST", urlObj.String(), bytes.NewReader([]byte(sdpOffer)))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", h.params.Token))
@@ -135,7 +136,7 @@ func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (string, err
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -143,17 +144,17 @@ func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (string, err
 
 	code := getErrorCodeForStatus(resp.StatusCode)
 	if code != psrpc.OK {
-		return "", psrpc.NewErrorf(code, "WHIP resource creation failed on SFU. code=%d", resp.StatusCode)
+		return nil, psrpc.NewError(code, errors.NewHTTPErrorFromResponse(resp))
 	}
 
 	locationHeader := resp.Header.Get("Location")
 	if locationHeader == "" {
-		return "", psrpc.NewErrorf(psrpc.MalformedResponse, "Missing Location header in SFU WHIP response")
+		return nil, psrpc.NewErrorf(psrpc.MalformedResponse, "Missing Location header in SFU WHIP response")
 	}
 
 	locationHeaderUrl, err := url.Parse(locationHeader)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	location := urlObj.ResolveReference(locationHeaderUrl)
@@ -162,16 +163,20 @@ func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (string, err
 	h.participantID = location.Path[strings.LastIndex(location.Path, "/")+1:]
 	if h.participantID != "" {
 		if err = h.rpcServer.RegisterWHIPRTCConnectionNotifyTopic(h.participantID); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return string(b), nil
+	return &WHIPInitResponse{
+		SDPAnswer:   string(b),
+		LinkHeaders: resp.Header.Values("Link"),
+		ETag:        resp.Header.Get("ETag"),
+	}, nil
 }
 
 func (h *proxyWhipHandler) SetMediaStatsGatherer(_ *stats.LocalMediaStatsGatherer) {
@@ -232,7 +237,7 @@ func (h *proxyWhipHandler) close(isRTCClosed bool) {
 
 	code := getErrorCodeForStatus(resp.StatusCode)
 	if code != psrpc.OK {
-		err = psrpc.NewErrorf(code, "WHIP resource deletion failed on SFU. code=%d", resp.StatusCode)
+		err = psrpc.NewError(code, errors.NewHTTPErrorFromResponse(resp))
 		h.logger.Warnw("WHIP delete request returned error status code", err, "statusCode", resp.StatusCode)
 		return
 	}
@@ -314,7 +319,7 @@ func (h *proxyWhipHandler) ICERestartWHIPResource(_ context.Context, req *rpc.IC
 
 	code := getErrorCodeForStatus(resp.StatusCode)
 	if code != psrpc.OK {
-		return nil, psrpc.NewErrorf(code, "WHIP resource patch failed on SFU. code=%d", resp.StatusCode)
+		return nil, psrpc.NewError(code, errors.NewHTTPErrorFromResponse(resp))
 	}
 
 	sdpResponse, err := io.ReadAll(resp.Body)
@@ -335,11 +340,11 @@ func (h *proxyWhipHandler) WHIPRTCConnectionNotify(_ context.Context, req *rpc.W
 	h.resetWatchDog()
 
 	if req.Video != nil {
-		h.params.SetInputVideoState(tctx, req.Video, true)
+		h.params.SetInputVideoState(tctx, req.Video, true, true)
 	}
 
 	if req.Audio != nil {
-		h.params.SetInputAudioState(tctx, req.Audio, true)
+		h.params.SetInputAudioState(tctx, req.Audio, true, true)
 	}
 
 	if req.Closed {

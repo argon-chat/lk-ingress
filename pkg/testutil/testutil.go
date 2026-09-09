@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2026 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package version
+// Package testutil holds helpers for tests only; it must not be imported
+// from production code.
+package testutil
 
-const Version = "1.5.0"
+import (
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// ShortTempDir returns a directory under /tmp for tests that create unix
+// sockets: t.TempDir() paths exceed the socket path limit (104 bytes on
+// darwin).
+func ShortTempDir(t *testing.T) string {
+	tmpDir, err := os.MkdirTemp("/tmp", "ingress-test")
+	require.NoError(t, err)
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+	return tmpDir
+}

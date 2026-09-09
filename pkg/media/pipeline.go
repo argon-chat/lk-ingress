@@ -17,6 +17,7 @@ package media
 import (
 	"context"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,6 +40,11 @@ var tracer = otel.Tracer("github.com/livekit/ingress/pkg/media")
 
 const (
 	creationTimeout = 10 * time.Second
+
+	// How much of the advertised duration playback may miss and still count as
+	// complete, as a percentage of it. A manifest duration is the sum of its
+	// segment durations, and the final segment can be shorter than it declares.
+	durationTolerancePercent = 5.0
 )
 
 type Pipeline struct {
@@ -56,6 +62,11 @@ type Pipeline struct {
 	pipelineErr chan error
 
 	eos *eosDispatcher
+
+	trackLock sync.Mutex
+
+	// The caps each stream kind's output was built from.
+	established map[types.StreamKind]string
 }
 
 func New(ctx context.Context, params *params.Params, g *stats.LocalMediaStatsGatherer) (*Pipeline, error) {
@@ -83,11 +94,15 @@ func New(ctx context.Context, params *params.Params, g *stats.LocalMediaStatsGat
 	}
 
 	p := &Pipeline{
-		Params:      params,
-		pipeline:    pipeline,
-		input:       input,
+		Params:   params,
+		pipeline: pipeline,
+		input:    input,
+		// SendEOS can reach the loop before Run does, so it is built here
+		// rather than on the way into the loop, and is never nil.
+		loop:        glib.NewMainLoop(glib.MainContextDefault(), false),
 		pipelineErr: make(chan error, 1),
 		eos:         newEOSDispatcher(),
+		established: make(map[types.StreamKind]string),
 	}
 
 	input.SetOnEOS(p.eos.Fire)
@@ -97,9 +112,7 @@ func New(ctx context.Context, params *params.Params, g *stats.LocalMediaStatsGat
 			(*cancel)()
 		}
 
-		if p.loop != nil {
-			p.loop.Quit()
-		}
+		p.quitLoop()
 	}, g, p.eos)
 	if err != nil {
 		return nil, err
@@ -120,6 +133,9 @@ func (p *Pipeline) onOutputReady(pad *gst.Pad, kind types.StreamKind) {
 		}
 	}()
 
+	currentCaps := pad.GetCurrentCaps()
+	logger.Debugw("output ready", "kind", kind, "capsAlreadySet", currentCaps != nil)
+
 	_, err = pad.Connect("notify::caps", func(gPad *gst.GhostPad, _ *glib.ParamSpec) {
 		p.onParamsReady(kind, gPad)
 	})
@@ -131,6 +147,24 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 	// TODO fix go-gst to not create non nil gst.Caps for a NULL native caps pointer?
 	caps, err := gPad.GetProperty("caps")
 	if err != nil || caps == nil || caps.(*gst.Caps) == nil || caps.(*gst.Caps).Unsafe() == nil {
+		return
+	}
+
+	newCaps := caps.(*gst.Caps)
+
+	// The audio and video pads notify on separate GStreamer streaming threads,
+	// so this map is shared mutable state and every access takes the lock.
+	p.trackLock.Lock()
+	builtCaps, built := p.established[kind]
+	p.trackLock.Unlock()
+
+	if built {
+		// Rebuilding is not an option -- it adds a second output of the same name
+		// and cannot restructure a published track -- so the session continues on
+		// the output it has. Caps the pipeline genuinely cannot take fail
+		// negotiation downstream and surface on the bus.
+		logger.Warnw("caps renegotiated after the output was built, continuing on the existing output", nil,
+			"kind", kind, "establishedCaps", builtCaps, "newCaps", newCaps.String())
 		return
 	}
 
@@ -146,7 +180,7 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 		p.SendStateUpdate(context.Background())
 	}()
 
-	bin, err := p.sink.AddTrack(kind, caps.(*gst.Caps))
+	bin, err := p.sink.AddTrack(kind, newCaps)
 	if err != nil {
 		return
 	}
@@ -155,6 +189,10 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 		logger.Errorw("could not add bin", err)
 		return
 	}
+
+	p.trackLock.Lock()
+	p.established[kind] = newCaps.String()
+	p.trackLock.Unlock()
 
 	gPad.AddProbe(gst.PadProbeTypeBlockDownstream, func(pad *gst.Pad, _ *gst.PadProbeInfo) gst.PadProbeReturn {
 		// link
@@ -178,10 +216,17 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	p.cancel.Store(&cancel)
 
+	// Shutdown already requested: bail out before starting anything. Only the
+	// sink needs closing; New brought it up, while the input has not started
+	// and closing an unstarted one blocks.
+	if p.closed.IsBroken() {
+		logger.Infow("shutdown requested before the pipeline started")
+		return p.sink.Close()
+	}
+
 	var err error
 
 	// add watch
-	p.loop = glib.NewMainLoop(glib.MainContextDefault(), false)
 	p.pipeline.GetPipelineBus().AddWatch(p.messageWatch)
 
 	// set state to playing (this does not start the pipeline)
@@ -234,6 +279,20 @@ func (p *Pipeline) messageWatch(msg *gst.Message) bool {
 	case gst.MessageEOS:
 		// EOS received - close and return
 		logger.Debugw("EOS received, stopping pipeline")
+
+		// This has to run before the pipeline goes to NULL, since a NULL
+		// pipeline answers no position query. A stop we asked for also ends
+		// playback early, so it says nothing about the source: skip the check
+		// then.
+		if !p.closed.IsBroken() {
+			if err := p.checkSourceComplete(); err != nil {
+				select {
+				case p.pipelineErr <- err:
+				default:
+				}
+			}
+		}
+
 		_ = p.pipeline.BlockSetState(gst.StateNull)
 		p.loop.Quit()
 		return false
@@ -277,6 +336,40 @@ func (p *Pipeline) messageWatch(msg *gst.Message) bool {
 	return true
 }
 
+// checkSourceComplete returns an error when EOS arrived before the source
+// played out the duration it advertises. A segment fetch that fails for good
+// arrives as an ordinary EOS, so the advertised duration is what separates a
+// truncated pull from a finished one.
+//
+// This catches HLS. A playlist declares no end, so the position query is
+// answered upstream, by what actually arrived. mp4 and matroska do declare an
+// end, so their sinks answer it instead and this returns nil. A source with no
+// duration is complete too: live HLS, RTMP and WHIP.
+func (p *Pipeline) checkSourceComplete() error {
+	ok, d := p.pipeline.QueryDuration(gst.FormatTime)
+	if !ok || d <= 0 {
+		return nil
+	}
+
+	ok, pos := p.pipeline.QueryPosition(gst.FormatTime)
+	if !ok || pos <= 0 {
+		logger.Debugw("no position at EOS, treating the source as complete",
+			"duration", time.Duration(d))
+		return nil
+	}
+
+	duration, position := time.Duration(d), time.Duration(pos)
+	if position+time.Duration(float64(duration)*durationTolerancePercent/100) >= duration {
+		return nil
+	}
+
+	logger.Warnw("source ended before the end of the stream", nil,
+		"position", position, "duration", duration)
+
+	return psrpc.NewErrorf(psrpc.Unavailable,
+		"source ended after %s of %s", position, duration)
+}
+
 func (p *Pipeline) handleStreamCollectionMessage(msg *gst.Message) {
 	collection := msg.ParseStreamCollection()
 	if collection == nil {
@@ -297,10 +390,10 @@ func (p *Pipeline) handleStreamCollectionMessage(msg *gst.Message) {
 		switch kind {
 		case types.Audio:
 			audioState := getAudioState(gstStruct)
-			p.SetInputAudioState(context.Background(), audioState, true)
+			p.SetInputAudioState(context.Background(), audioState, true, false)
 		case types.Video:
 			videoState := getVideoState(gstStruct)
-			p.SetInputVideoState(context.Background(), videoState, true)
+			p.SetInputVideoState(context.Background(), videoState, true, false)
 		}
 	}
 }
@@ -320,39 +413,56 @@ func (p *Pipeline) SendEOS(ctx context.Context) {
 	_, span := tracer.Start(ctx, "Pipeline.SendEOS")
 	defer span.End()
 
-	p.closed.Once(func() {
-		logger.Debugw("closing pipeline")
+	// Break before loading the cancel below. Run stores its cancel and then
+	// checks the fuse, so this order leaves no interleaving where Run both
+	// misses the check and has not yet stored a cancel for this to find.
+	if !p.closed.Break() {
+		return
+	}
 
-		if cancel := p.cancel.Load(); cancel != nil {
-			(*cancel)()
+	logger.Debugw("closing pipeline")
+
+	if cancel := p.cancel.Load(); cancel != nil {
+		(*cancel)()
+	}
+
+	c := make(chan struct{})
+
+	go func() {
+		err := p.pipeline.BlockSetState(gst.StateNull)
+		if err != nil {
+			logger.Errorw("failed stopping pipeline", err)
 		}
 
-		c := make(chan struct{})
+		close(c)
+	}()
 
-		go func() {
-			err := p.pipeline.BlockSetState(gst.StateNull)
-			if err != nil {
-				logger.Errorw("failed stopping pipeline", err)
-			}
+	go func() {
+		t := time.NewTimer(5 * time.Second)
 
-			close(c)
-		}()
+		select {
+		case <-c:
+			t.Stop()
+		case <-t.C:
+			// Do not set ingress in error state as we are stopping and this causes some media at the end
+			// to not be sent to the room at worse
+			logger.Errorw("pipeline frozen", psrpc.NewErrorf(psrpc.Internal, "pipeline frozen"))
+		}
 
-		go func() {
-			t := time.NewTimer(5 * time.Second)
+		p.quitLoop()
+	}()
+}
 
-			select {
-			case <-c:
-				t.Stop()
-			case <-t.C:
-				// Do not set ingress in error state as we are stopping and this causes some media at the end
-				// to not be sent to the room at worse
-				logger.Errorw("pipeline frozen", psrpc.NewErrorf(psrpc.Internal, "pipeline frozen"))
-			}
-
-			p.loop.Quit()
-		}()
-	})
+// quitLoop stops the main loop, and is safe to call before Run has started it:
+// the quit is queued on the main context and dispatched when the loop runs.
+// Calling Quit directly is not safe there, because g_main_loop_run sets
+// is_running=TRUE on entry and overwrites it. Assumes this is the only main
+// loop on the default context.
+func (p *Pipeline) quitLoop() {
+	if _, err := glib.IdleAdd(p.loop.Quit); err != nil {
+		logger.Errorw("failed to schedule loop quit, quitting directly", err)
+		p.loop.Quit()
+	}
 }
 
 func (p *Pipeline) GetGstPipelineDebugDot() string {
