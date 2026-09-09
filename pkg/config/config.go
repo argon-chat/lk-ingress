@@ -61,6 +61,9 @@ type ServiceConfig struct {
 	WHIPPort           int             `yaml:"whip_port"`             // -1 to disable WHIP
 	AudioWSPort        int             `yaml:"audio_ws_port"`         // -1 to disable AudioWS
 	MaxAudioWSSessions int             `yaml:"max_audio_ws_sessions"` // 0 = unlimited
+	AudioWTPort        int             `yaml:"audio_wt_port"`         // WebTransport (HTTP/3) duplex endpoint. -1 to disable
+	AudioWTCertFile    string          `yaml:"audio_wt_cert_file"`    // TLS certificate for WebTransport. Empty generates a short lived self signed one
+	AudioWTKeyFile     string          `yaml:"audio_wt_key_file"`     // TLS key for WebTransport
 	HTTPRelayPort      int             `yaml:"http_relay_port"`
 	Logging            logger.Config   `yaml:"logging"`
 	Development        bool            `yaml:"development"`

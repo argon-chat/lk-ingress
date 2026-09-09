@@ -1,4 +1,5 @@
 // Copyright 2024 LiveKit, Inc.
+// Copyright 2026 Argon Inc. LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +18,9 @@ package audiows
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -25,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/webtransport-go"
 
 	"github.com/livekit/ingress/pkg/config"
 	"github.com/livekit/ingress/pkg/stats"
@@ -61,6 +65,7 @@ type AudioWSServer struct {
 
 	server   *http.Server
 	upgrader websocket.Upgrader
+	wtServer *webtransport.Server
 
 	sessionsLock      sync.Mutex
 	sessions          map[string]*AudioWSSession
@@ -88,24 +93,32 @@ func (s *AudioWSServer) Start(conf *config.Config, monitor *stats.Monitor) error
 	s.wsUrl = conf.WsUrl
 	s.monitor = monitor
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/audio/connect", s.handleConnect)
-	mux.HandleFunc("/audio/subscribe", s.handleSubscribe)
-	mux.HandleFunc("/audio/duplex", s.handleDuplex)
+	if conf.AudioWSPort > 0 {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/audio/connect", s.handleConnect)
+		mux.HandleFunc("/audio/subscribe", s.handleSubscribe)
+		mux.HandleFunc("/audio/duplex", s.handleDuplex)
 
-	s.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", conf.AudioWSPort),
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		s.server = &http.Server{
+			Addr:         fmt.Sprintf(":%d", conf.AudioWSPort),
+			Handler:      mux,
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 10 * time.Second,
+		}
+
+		go func() {
+			logger.Infow("starting AudioWS server", "port", conf.AudioWSPort)
+			if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Errorw("AudioWS server failed", err)
+			}
+		}()
 	}
 
-	go func() {
-		logger.Infow("starting AudioWS server", "port", conf.AudioWSPort)
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Errorw("AudioWS server failed", err)
+	if conf.AudioWTPort > 0 {
+		if err := s.startWebTransport(conf); err != nil {
+			return err
 		}
-	}()
+	}
 
 	return nil
 }
@@ -141,6 +154,8 @@ func (s *AudioWSServer) Stop() {
 		defer cancel()
 		s.server.Shutdown(ctx)
 	}
+
+	s.stopWebTransport()
 }
 
 func (s *AudioWSServer) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -477,73 +492,105 @@ func (s *AudioWSServer) removeSubscribeSession(sessionID string) {
 	s.sessionsLock.Unlock()
 }
 
-func (s *AudioWSServer) handleDuplex(w http.ResponseWriter, r *http.Request) {
-	// Extract and validate JWT
+// duplexRequest is an authorized duplex connection request. The WebSocket and
+// WebTransport entry points read the same token and the same query parameters,
+// so they stay in step through this one place.
+type duplexRequest struct {
+	room     string
+	identity string
+	name     string
+
+	targetIdentity string
+	targetSource   string
+
+	stereo          bool
+	frameDurationMs int
+	trackName       string
+	trackSource     string
+	metadata        string
+}
+
+// authorizeDuplex verifies the bot's token and parses the duplex parameters. On
+// rejection it returns the HTTP status to answer the request with.
+func (s *AudioWSServer) authorizeDuplex(r *http.Request) (*duplexRequest, int, error) {
 	tokenStr := extractToken(r)
 	if tokenStr == "" {
-		http.Error(w, "missing authorization token", http.StatusUnauthorized)
-		return
+		return nil, http.StatusUnauthorized, errors.New("missing authorization token")
 	}
 
 	verifier, err := auth.ParseAPIToken(tokenStr)
 	if err != nil {
-		http.Error(w, "invalid token format", http.StatusUnauthorized)
-		return
+		return nil, http.StatusUnauthorized, errors.New("invalid token format")
 	}
 
 	if verifier.APIKey() != s.apiKey {
-		http.Error(w, "invalid API key", http.StatusForbidden)
-		return
+		return nil, http.StatusForbidden, errors.New("invalid API key")
 	}
 
 	_, grants, err := verifier.Verify(s.apiSecret)
 	if err != nil {
-		http.Error(w, "token verification failed", http.StatusForbidden)
-		return
+		return nil, http.StatusForbidden, errors.New("token verification failed")
 	}
 
 	if grants.Video == nil || grants.Video.Room == "" {
-		http.Error(w, "token must include room grant", http.StatusForbidden)
-		return
+		return nil, http.StatusForbidden, errors.New("token must include room grant")
 	}
 
-	room := grants.Video.Room
-	identity := grants.Identity
-	name := grants.Name
-	if identity == "" {
-		http.Error(w, "token must include identity", http.StatusForbidden)
-		return
+	if grants.Identity == "" {
+		return nil, http.StatusForbidden, errors.New("token must include identity")
 	}
 
-	// Parse duplex-specific params
-	targetIdentity := r.URL.Query().Get("target_identity")
+	q := r.URL.Query()
+
+	targetIdentity := q.Get("target_identity")
 	if targetIdentity == "" {
-		http.Error(w, "missing target_identity parameter", http.StatusBadRequest)
-		return
+		return nil, http.StatusBadRequest, errors.New("missing target_identity parameter")
 	}
-	targetSource := r.URL.Query().Get("target_track_source")
 
-	// Parse audio publish config
-	stereo := r.URL.Query().Get("stereo") == "true" || r.URL.Query().Get("channels") == "2"
-	frameDurationMs, _ := strconv.Atoi(r.URL.Query().Get("frame_duration_ms"))
-	trackName := r.URL.Query().Get("track_name")
-	trackSource := r.URL.Query().Get("track_source")
-	metadata := r.URL.Query().Get("metadata")
+	frameDurationMs, _ := strconv.Atoi(q.Get("frame_duration_ms"))
 
-	// Check max sessions limit
+	return &duplexRequest{
+		room:            grants.Video.Room,
+		identity:        grants.Identity,
+		name:            grants.Name,
+		targetIdentity:  targetIdentity,
+		targetSource:    q.Get("target_track_source"),
+		stereo:          q.Get("stereo") == "true" || q.Get("channels") == "2",
+		frameDurationMs: frameDurationMs,
+		trackName:       q.Get("track_name"),
+		trackSource:     q.Get("track_source"),
+		metadata:        q.Get("metadata"),
+	}, http.StatusOK, nil
+}
+
+// admitSession checks the session limit and the CPU budget shared by every
+// audio session, whatever transport it arrived on.
+func (s *AudioWSServer) admitSession() (int, error) {
 	if s.conf.MaxAudioWSSessions > 0 {
 		s.sessionsLock.Lock()
 		count := len(s.sessions) + len(s.subscribeSessions) + len(s.duplexSessions)
 		s.sessionsLock.Unlock()
 		if count >= s.conf.MaxAudioWSSessions {
-			http.Error(w, "max audio WS sessions reached", http.StatusServiceUnavailable)
-			return
+			return http.StatusServiceUnavailable, errors.New("max audio sessions reached")
 		}
 	}
 
-	// Check CPU capacity
 	if !s.monitor.AcceptAudioWSSession() {
-		http.Error(w, "server at capacity", http.StatusServiceUnavailable)
+		return http.StatusServiceUnavailable, errors.New("server at capacity")
+	}
+
+	return http.StatusOK, nil
+}
+
+func (s *AudioWSServer) handleDuplex(w http.ResponseWriter, r *http.Request) {
+	req, status, err := s.authorizeDuplex(r)
+	if err != nil {
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	if status, err := s.admitSession(); err != nil {
+		http.Error(w, err.Error(), status)
 		return
 	}
 
@@ -555,42 +602,34 @@ func (s *AudioWSServer) handleDuplex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := protoutils.NewGuid("AWS_")
-	l := logger.GetLogger().WithValues("sessionID", sessionID, "room", room, "identity", identity, "targetIdentity", targetIdentity)
+	l := logger.GetLogger().WithValues("sessionID", sessionID, "room", req.room, "identity", req.identity, "targetIdentity", req.targetIdentity)
 	l.Infow("new audio WS duplex connection",
-		"stereo", stereo, "frameDurationMs", frameDurationMs,
-		"trackName", trackName, "targetSource", targetSource,
+		"stereo", req.stereo, "frameDurationMs", req.frameDurationMs,
+		"trackName", req.trackName, "targetSource", req.targetSource,
 	)
 
-	go s.runDuplexSession(conn, sessionID, room, identity, name, targetIdentity, targetSource, stereo, frameDurationMs, trackName, trackSource, metadata, l)
+	go s.runDuplex(newWSTransport(conn), sessionID, req, l)
 }
 
-func (s *AudioWSServer) runDuplexSession(
-	conn *websocket.Conn, sessionID, room, identity, name string,
-	targetIdentity, targetSource string,
-	stereo bool, frameDurationMs int,
-	trackName, trackSource, metadata string,
-	l logger.Logger,
-) {
-	defer conn.Close()
-
-	conn.SetReadLimit(wsReadLimit)
-	conn.SetReadDeadline(time.Now().Add(wsPongWait))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(wsPongWait))
-		return nil
-	})
+// runDuplex owns a duplex session for the lifetime of its transport, whether
+// that is a WebSocket or a WebTransport connection.
+func (s *AudioWSServer) runDuplex(tr audioTransport, sessionID string, req *duplexRequest, l logger.Logger) {
+	defer tr.Close()
 
 	duplex, err := NewAudioWSDuplex(
-		sessionID, conn,
-		room, identity, name,
-		targetIdentity, targetSource,
+		sessionID, tr,
+		req.room, req.identity, req.name,
+		req.targetIdentity, req.targetSource,
 		s.apiKey, s.apiSecret, s.wsUrl,
-		stereo, frameDurationMs,
-		trackName, trackSource, metadata,
+		req.stereo, req.frameDurationMs,
+		req.trackName, req.trackSource, req.metadata,
 	)
 	if err != nil {
 		l.Errorw("failed to create duplex session", err)
-		writeError(conn, "failed to create duplex session: "+err.Error())
+		tr.SendJSON(errorMessage{
+			Status:  "error",
+			Message: "failed to create duplex session: " + err.Error(),
+		})
 		return
 	}
 
@@ -603,32 +642,22 @@ func (s *AudioWSServer) runDuplexSession(
 
 	s.monitor.AudioWSSessionStarted()
 
-	// Send ready message
-	readyMsg, _ := json.Marshal(readyMessage{
+	if err := tr.SendJSON(readyMessage{
 		Status:    "ready",
 		SessionID: sessionID,
-	})
-	conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	if err := conn.WriteMessage(websocket.TextMessage, readyMsg); err != nil {
+	}); err != nil {
 		l.Warnw("failed to send ready message", err)
 		return
 	}
 
-	// Start ping loop
-	go duplex.runPingLoop()
-
-	// Read loop — binary messages are Opus frames to publish
+	// Read loop — every inbound frame is an Opus frame to publish
 	for {
-		msgType, data, err := conn.ReadMessage()
+		data, err := tr.ReadFrame()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				l.Warnw("websocket read error", err)
+			if !errors.Is(err, io.EOF) {
+				l.Warnw("duplex transport read error", err, "transport", tr.Kind())
 			}
 			return
-		}
-
-		if msgType != websocket.BinaryMessage {
-			continue
 		}
 
 		if err := duplex.HandleOpusFrame(data); err != nil {

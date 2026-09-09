@@ -1,4 +1,5 @@
 // Copyright 2024 LiveKit, Inc.
+// Copyright 2026 Argon Inc. LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,6 +39,10 @@ type noopStateNotifier struct{}
 func (n *noopStateNotifier) UpdateIngressState(_ context.Context, _ string, _ *livekit.IngressInfo) error {
 	return nil
 }
+
+func (n *noopStateNotifier) SessionStarted(_ context.Context, _ string, _ *livekit.IngressInfo) {}
+
+func (n *noopStateNotifier) SessionEnded(_ context.Context, _ string) {}
 
 const (
 	defaultFrameDuration = 20 * time.Millisecond

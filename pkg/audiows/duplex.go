@@ -1,4 +1,5 @@
 // Copyright 2024 LiveKit, Inc.
+// Copyright 2026 Argon Inc. LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +16,10 @@
 package audiows
 
 import (
-	"encoding/json"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/frostbyte73/core"
-	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
@@ -39,8 +37,7 @@ type AudioWSDuplex struct {
 	sessionID string
 	logger    logger.Logger
 	room      *lksdk.Room
-	conn      *websocket.Conn
-	writeMu   sync.Mutex
+	transport audioTransport
 
 	localTrack    *lksdk.LocalSampleTrack
 	frameDuration time.Duration
@@ -53,7 +50,7 @@ type AudioWSDuplex struct {
 
 func NewAudioWSDuplex(
 	sessionID string,
-	conn *websocket.Conn,
+	transport audioTransport,
 	room, identity, name string,
 	targetIdentity, targetSource string,
 	apiKey, apiSecret, wsUrl string,
@@ -71,7 +68,7 @@ func NewAudioWSDuplex(
 	d := &AudioWSDuplex{
 		sessionID:      sessionID,
 		logger:         l,
-		conn:           conn,
+		transport:      transport,
 		targetIdentity: targetIdentity,
 		targetSource:   targetSource,
 		frameDuration:  defaultFrameDuration,
@@ -116,7 +113,7 @@ func NewAudioWSDuplex(
 	cb.OnDisconnectedWithReason = func(reason lksdk.DisconnectionReason) {
 		l.Infow("room disconnected", "reason", reason)
 		d.fuse.Break()
-		conn.Close()
+		transport.Close()
 	}
 
 	// Join room — auto-subscribe disabled so we only subscribe to the target
@@ -245,7 +242,7 @@ func (d *AudioWSDuplex) readTrackLoop(track *webrtc.TrackRemote) {
 
 		if err := d.writeOpusFrame(pkt.Payload); err != nil {
 			if !d.fuse.IsBroken() {
-				d.logger.Warnw("failed to write opus frame to WS", err)
+				d.logger.Warnw("failed to write opus frame to the client", err)
 			}
 			return
 		}
@@ -264,36 +261,12 @@ func (d *AudioWSDuplex) HandleOpusFrame(data []byte) error {
 }
 
 func (d *AudioWSDuplex) writeOpusFrame(data []byte) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-	d.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	return d.conn.WriteMessage(websocket.BinaryMessage, data)
+	return d.transport.WriteFrame(data)
 }
 
 func (d *AudioWSDuplex) sendJSON(v interface{}) {
-	data, _ := json.Marshal(v)
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-	d.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	d.conn.WriteMessage(websocket.TextMessage, data)
-}
-
-func (d *AudioWSDuplex) runPingLoop() {
-	ticker := time.NewTicker(wsPingInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			d.writeMu.Lock()
-			d.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-			err := d.conn.WriteMessage(websocket.PingMessage, nil)
-			d.writeMu.Unlock()
-			if err != nil {
-				return
-			}
-		case <-d.fuse.Watch():
-			return
-		}
+	if err := d.transport.SendJSON(v); err != nil {
+		d.logger.Debugw("failed to send control message", "error", err.Error())
 	}
 }
 

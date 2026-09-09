@@ -155,7 +155,7 @@ func runService(_ context.Context, c *cli.Command) error {
 			return err
 		}
 	}
-	if conf.AudioWSPort > 0 {
+	if conf.AudioWSPort > 0 || conf.AudioWTPort > 0 {
 		audiowssrv = audiows.NewAudioWSServer()
 	}
 
