@@ -33,6 +33,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +61,10 @@ const (
 	wtFrameQueue   = 128 // inbound frames buffered before new ones are dropped
 	wtRecordHeader = 4
 	wtCertValidity = 13 * 24 * time.Hour // browsers cap serverCertificateHashes certs at 14 days
+
+	// How often the certificate files are restatted. Handshakes are rare here,
+	// and a renewal only has to be noticed within minutes.
+	wtCertCheckInterval = time.Minute
 
 	// wtStreamRejected is the stream error code sent when a stream cannot be used.
 	wtStreamRejected = 0x01
@@ -387,11 +392,24 @@ func (t *wtTransport) pushFrame(data []byte) bool {
 // client can pin it.
 func wtTLSConfig(conf *config.Config) (*tls.Config, error) {
 	if conf.AudioWTCertFile != "" && conf.AudioWTKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(conf.AudioWTCertFile, conf.AudioWTKeyFile)
+		// Read through a reloader rather than loading once: ACME renewals rewrite
+		// these files under a long lived process, so a certificate loaded at
+		// startup would go stale months before the process is next restarted.
+		reloader, err := newCertReloader(conf.AudioWTCertFile, conf.AudioWTKeyFile)
 		if err != nil {
 			return nil, err
 		}
-		return wtTLSConfigWithCert(cert), nil
+
+		tlsConf := wtTLSConfigWithCert(tls.Certificate{})
+		tlsConf.Certificates = nil
+		tlsConf.GetCertificate = reloader.GetCertificate
+
+		logger.Infow("AudioWT is using a certificate from disk",
+			"certFile", conf.AudioWTCertFile,
+			"notAfter", reloader.notAfter().Format(time.RFC3339),
+		)
+
+		return tlsConf, nil
 	}
 
 	cert, fingerprint, err := generateWTCert()
@@ -417,6 +435,115 @@ func wtTLSConfigWithCert(cert tls.Certificate) *tls.Config {
 		NextProtos:   []string{http3.NextProtoH3},
 		MinVersion:   tls.VersionTLS13,
 	}
+}
+
+// certReloader serves the certificate from disk and picks up renewals without a
+// restart. Caddy and certbot rewrite the certificate and the key as two separate
+// files, so a load can catch them mid renewal and fail; when that happens the
+// certificate already loaded keeps being served and the next check tries again.
+type certReloader struct {
+	certFile string
+	keyFile  string
+
+	mu        sync.Mutex
+	cert      *tls.Certificate
+	stamps    [2]fileStamp
+	checkedAt time.Time
+}
+
+// fileStamp is the cheap fingerprint used to notice a rewritten file.
+type fileStamp struct {
+	modTime time.Time
+	size    int64
+}
+
+func newCertReloader(certFile, keyFile string) (*certReloader, error) {
+	r := &certReloader{certFile: certFile, keyFile: keyFile}
+
+	// Load eagerly: a wrong path or an unreadable key should fail startup rather
+	// than the first bot that connects.
+	if err := r.load(); err != nil {
+		return nil, err
+	}
+	r.checkedAt = time.Now()
+
+	return r, nil
+}
+
+func (r *certReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if time.Since(r.checkedAt) < wtCertCheckInterval {
+		return r.cert, nil
+	}
+	r.checkedAt = time.Now()
+
+	if r.stat() == r.stamps {
+		return r.cert, nil
+	}
+
+	if err := r.load(); err != nil {
+		// A half written renewal, or the files briefly missing: keep serving what
+		// is loaded and look again on the next check.
+		logger.Warnw("AudioWT certificate reload failed, keeping the loaded one", err,
+			"certFile", r.certFile)
+		return r.cert, nil
+	}
+
+	logger.Infow("AudioWT certificate reloaded",
+		"certFile", r.certFile,
+		"notAfter", r.cert.Leaf.NotAfter.Format(time.RFC3339),
+	)
+
+	return r.cert, nil
+}
+
+func (r *certReloader) notAfter() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.cert.Leaf.NotAfter
+}
+
+// stat fingerprints both files. An unreadable file yields the zero stamp, which
+// differs from any successful read and so schedules another attempt.
+func (r *certReloader) stat() [2]fileStamp {
+	var stamps [2]fileStamp
+
+	for i, name := range []string{r.certFile, r.keyFile} {
+		info, err := os.Stat(name)
+		if err != nil {
+			return [2]fileStamp{}
+		}
+		stamps[i] = fileStamp{modTime: info.ModTime(), size: info.Size()}
+	}
+
+	return stamps
+}
+
+// load reads the pair from disk. Stamps are taken before the read, so a file
+// rewritten during it is picked up by the next check instead of being missed.
+func (r *certReloader) load() error {
+	stamps := r.stat()
+
+	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
+	if err != nil {
+		return err
+	}
+
+	// Parse the leaf once, so the expiry can be logged and handshakes are spared
+	// the work.
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return err
+	}
+	cert.Leaf = leaf
+
+	r.cert = &cert
+	r.stamps = stamps
+
+	return nil
 }
 
 func generateWTCert() (tls.Certificate, []byte, error) {
